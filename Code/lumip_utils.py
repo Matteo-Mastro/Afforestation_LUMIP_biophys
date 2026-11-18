@@ -1,53 +1,7 @@
 """
 lumip_utils.py
 ================
-Shared helper functions for the `code/revision` LUMIP afforestation/reforestation
-analysis notebooks (ssp370 vs ssp126Lu, LUMIP deforestation/afforestation
-experiment).
-
-Every notebook in `code/revision` that needs one of these functions should
-import it from here (`from lumip_utils import ...`) instead of carrying its own
-copy-pasted definition. This is the single source of truth for two corrections
-made during the August 2026 revision:
-
-1. **Evaporative-regime classification (`regime_limit` / `classify_regime`)**
-   was computed on the *raw* monthly hfls/pr/ts series. Because all three fields
-   have a strong shared seasonal cycle, the water-vs-energy-limited correlation
-   test was almost entirely driven by that shared seasonality rather than by the
-   interannual land-atmosphere coupling signal it is meant to capture (the
-   Seneviratne/Denissen definition of the evaporative regime is based on
-   interannual anomalies). A deseasonalizing fix (removing the monthly
-   climatology, `deseason`, from hfls/pr/ts before correlating) was added and is
-   still available as `method="deseason"` below -- **but by the user's explicit
-   request (Aug 2026) the default has been reverted to `method="raw"`**, i.e.
-   the original, non-deseasonalized behaviour, everywhere in `code/revision`.
-   `regime_limit`/`classify_regime`'s default argument controls this for every
-   notebook that calls them without passing `method=`; the two notebooks with
-   their own explicit `REGIME_METHOD` config cell (`water_avail_bootstrap.ipynb`,
-   `water_avail_final.ipynb`) have that variable set to `"raw"` for the same
-   reason. See `REVISION_NOTES.md` for the full history of this back-and-forth.
-
-2. **4GST phenology classification (`compute_4gst`, replacing the old
-   `classify_phenology` / `phen_4gst`)** had a bug in the evergreen test: it
-   compared the seasonal amplitude to the annual *minimum* LAI
-   (`amp < 0.25 * lai_min`) instead of the annual *mean* LAI
-   (`amp / lai_mean < 0.25`), and had no guard against `lai_mean <= 0`. Since
-   `lai_min` is frequently close to zero (any cell with a bare-soil month),
-   `0.25 * lai_min` is itself close to zero and the evergreen branch almost
-   never triggered, so a nontrivial fraction of weakly-seasonal/evergreen
-   cells were being run through the onset/offset slope classifier instead
-   and got a spurious onset/offset window instead of "all 12 months are
-   growing season". `compute_4gst` below is the corrected version, supplied
-   directly by the user (Peano et al. 2019 4GST method); it is used everywhere
-   growing-season classification is needed and its outputs (onset, offset,
-   gst_type) are cached to disk by `grow_seas.ipynb` for the other notebooks
-   to load (see `growing_season_mask` below and `grow_seas.ipynb`).
-
-Everything else in this module (`lag_linregress_3D`, `cell_weight`, `lon180`,
-`xr_fix_time`, `xr_clean`, `detrend_dim`, `multi_apply_along_axis`,
-`xr_multipletest`, `xr_multimodel_sign`) is copied verbatim from the original
-notebooks (byte-for-byte identical logic) purely so every revised notebook can
-`import` a single copy instead of six slightly-drifted ones.
+Shared helper functions
 """
 import numpy as np
 import pandas as pd
@@ -186,10 +140,6 @@ def xr_multimodel_sign(xr_in, models):
     return mean, std, agreement
 
 
-# ---------------------------------------------------------------------------
-# FIX 1 -- evaporative-regime classification (deseasonalized)
-# ---------------------------------------------------------------------------
-
 def deseason(da):
     """Remove the monthly climatology, leaving interannual anomalies.
     `da.groupby("time.month") - da.groupby("time.month").mean("time")`, tidied
@@ -218,24 +168,12 @@ def classify_regime(ds, method="raw"):
 
 
 def regime_limit(dataset, method="raw", drop=False):
-    """Same call signature and return contract as the original
-    `regime_limit(dataset)` used throughout the pre-revision notebooks (a pair
-    of 2-D `lai` DataArrays, valid only where water-/energy-limited
-    respectively), so downstream code (`mask_aff_water[m].notnull()`, etc.) is
-    unaffected regardless of `method`.
-
+    """
     `method="raw"` (default) correlates the raw monthly hfls/pr/ts series --
     this reproduces the original, pre-revision behaviour exactly, restored as
     the default by explicit user request (Aug 2026) after briefly defaulting to
-    `method="deseason"` (still available, and statistically the more defensible
-    choice -- it removes the shared seasonal cycle from hfls/pr/ts before
+    `method="deseason"` removes the shared seasonal cycle from hfls/pr/ts before
     correlating, see module docstring -- but not the current default here).
-
-    `drop` matches the original per-notebook choice: `grow_seas`/`water_avail*`/
-    `seb_grow_seas`/`roughness_scale*` used `drop=False` (keep full grid, NaN
-    outside the regime); `mlr_comp`/`mlr_proc` used `drop=True` (compact away
-    all-NaN slices). Both are label-aligned by xarray downstream regardless of
-    `drop`, but each notebook here keeps its original setting.
     """
     le, pr, ts = dataset["hfls"], dataset["pr"], dataset["ts"]
     if method == "deseason":
@@ -248,31 +186,16 @@ def regime_limit(dataset, method="raw", drop=False):
     energy_limited = dataset.isel(time=-1).where(cor_pr < cor_ts, drop=drop)["lai"]
     return water_limited, energy_limited
 
-
-# ---------------------------------------------------------------------------
-# FIX 2 -- 4GST growing-season-type classification (evergreen bug fixed)
-# ---------------------------------------------------------------------------
-
 def compute_4gst(clim_da, month_dim="month"):
     """
     Growing-season-type classification (4GST method, Peano et al. 2019),
     applied per-pixel to the climatological (12-month) mean LAI cycle.
-    Reference implementation as supplied directly by the user; GST values:
+    GST values:
       1, 2 -- single growing season (unimodal), mirror-image slope patterns
       3    -- two growing seasons per year (double-cropping / bimodal)
       4    -- evergreen / weakly seasonal (amplitude below 25% of the annual
               mean LAI); all 12 months are retained as growing season
       0    -- undefined / fallback
-
-    Corrects the evergreen test relative to the original `classify_phenology`
-    / `phen_4gst` found across the pre-revision notebooks, which tested
-    `amp < 0.25 * lai_min` (amplitude vs. the annual *minimum*, with no floor
-    on `lai_min`) instead of `amp / lai_mean < 0.25` (amplitude vs. the annual
-    *mean*, guarded against `lai_mean <= 0`). Because `lai_min` is close to
-    zero for most vegetated cells, the old test's threshold collapsed toward
-    zero and rarely fired, so evergreen/weakly-seasonal cells were frequently
-    misrouted into the onset/offset slope classifier instead of being flagged
-    as evergreen (all-year growing season).
     """
     def _pixel(series):
         series = np.asarray(series)
@@ -326,25 +249,6 @@ def growing_season_reduce(series, months, onset, offset):
     `series` restricted to the months between `onset` and `offset`
     (inclusive), handling the Southern-Hemisphere wrap-around case
     (onset > offset) explicitly.
-
-    The original mask, `(months >= onset) & (months <= offset)`, silently
-    evaluates to all-False for *every* month whenever onset > offset (a
-    growing season that crosses the calendar-year boundary, e.g.
-    onset=October, offset=March) -- i.e. it masked out the entire year,
-    including the actual growing season, at every such pixel. This is the
-    "must mask only the portions of the year where vegetation is active" bug:
-    for wrap-around pixels the old code masked none of the active months (and
-    all of the inactive ones), so `np.nanmean(series[mask])` silently reduced
-    to a mean of an all-empty selection.
-
-    Meant for use with `xr.apply_ufunc(growing_season_reduce, series, months,
-    onset, offset, input_core_dims=[["time"], ["time"], [], []],
-    output_core_dims=[[]], vectorize=True, ...)`, exactly as the original
-    `growing_season()` was used -- i.e. this collapses the selected period to
-    a single climatological growing-season-mean value per pixel. For an
-    analysis that instead needs the growing season masked *without* collapsing
-    the time dimension (e.g. an interannual regression), use
-    `growing_season_mask` below with `.where(...)` instead.
     """
     if np.isnan(onset) or np.isnan(offset):
         return np.nanmean(series)
@@ -362,18 +266,6 @@ def growing_season_mask(time_da, onset, offset):
     per-pixel `onset`/`offset` month numbers (1-12), False outside it and at
     pixels with undefined onset/offset. Handles the southern-hemisphere
     wrap-around case (onset > offset) explicitly.
-
-    `time_da` is any DataArray/coordinate exposing `.dt.month` along `time`
-    (e.g. `ds.time`). Unlike the pre-revision `growing_season()` /
-    `phen_gs()` helpers -- which collapsed the whole selected period to a
-    single `nanmean` scalar per pixel, discarding the time dimension -- this
-    returns a mask the same shape as the data, so that
-    `ds.where(growing_season_mask(ds.time, onset, offset))` keeps the full
-    (annual/monthly) time resolution and simply sets non-growing-season
-    time steps to NaN. This is what "masking only the portions of the year
-    where vegetation is active" means: downstream notebooks choose their own
-    reduction (annual mean/sum, climatology, regression, ...) on the masked,
-    still time-resolved data, rather than getting a pre-collapsed scalar.
     """
     months = time_da.dt.month
     cond_normal = (months >= onset) & (months <= offset)
